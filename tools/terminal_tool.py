@@ -1601,14 +1601,79 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
                 logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
 
 
+# Chromium orphan reaper — piggy-backs on the existing cleanup thread.
+# The cleanup worker below sleeps 60s between environment sweeps, so counting
+# 15 of those ticks gives a 15-minute cadence for the orphan-Chromium scan
+# without introducing another thread. Gated OFF by default; flip
+# ``HERMES_CHROMIUM_ORPHAN_REAPER_ENABLED=1`` to observe scan logs. Execute
+# mode is still blocked by an explicit ``RuntimeError`` inside the reaper
+# module until the human operator authorizes activation.
+_CHROMIUM_REAPER_TICKS_BETWEEN_SCANS = 15
+
+
+def _chromium_orphan_reaper_enabled() -> bool:
+    return os.getenv("HERMES_CHROMIUM_ORPHAN_REAPER_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _maybe_reap_chromium_orphans() -> None:
+    """Run one dry-run scan of the Chromium profile reaper, if enabled.
+
+    Silent no-op when disabled or when any dependency (psutil, browser_tool)
+    is unreachable — the cleanup thread must never crash because an optional
+    janitor tripped.
+    """
+    if not _chromium_orphan_reaper_enabled():
+        return
+    try:
+        from tools.chromium_profile_reaper import (
+            default_jsonl_log_path,
+            default_process_snapshot_provider,
+            default_socket_roots,
+            make_jsonl_event_logger,
+            run_chromium_profile_reaper,
+        )
+    except ImportError as exc:
+        logger.debug("chromium orphan reaper unavailable: %s", exc)
+        return
+
+    try:
+        from tools import browser_tool
+        active_sessions = dict(getattr(browser_tool, "_active_sessions", {}))
+    except Exception:
+        active_sessions = {}
+
+    log_event = make_jsonl_event_logger(default_jsonl_log_path())
+    try:
+        run_chromium_profile_reaper(
+            dry_run=True,
+            active_sessions=active_sessions,
+            process_snapshot_provider=default_process_snapshot_provider,
+            socket_roots=default_socket_roots(),
+            log_event=log_event,
+        )
+    except Exception as exc:
+        logger.debug("chromium orphan reaper scan raised: %s", exc)
+
+
 def _cleanup_thread_worker():
     """Background thread worker that periodically cleans up inactive environments."""
+    chromium_tick = 0
     while _cleanup_running:
         try:
             config = _get_env_config()
             _cleanup_inactive_envs(config["lifetime_seconds"])
         except Exception as e:
             logger.warning("Error in cleanup thread: %s", e, exc_info=True)
+
+        chromium_tick += 1
+        if chromium_tick >= _CHROMIUM_REAPER_TICKS_BETWEEN_SCANS:
+            chromium_tick = 0
+            try:
+                _maybe_reap_chromium_orphans()
+            except Exception as e:
+                logger.debug("chromium orphan reaper crashed inside worker: %s", e)
 
         for _ in range(60):
             if not _cleanup_running:
