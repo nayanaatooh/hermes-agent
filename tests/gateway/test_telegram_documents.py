@@ -474,6 +474,43 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.call_args[0][0]
         assert "could not be downloaded" in (event.text or "")
 
+    @pytest.mark.asyncio
+    async def test_pre_media_hook_skips_voice_before_download_and_dispatch(self, adapter):
+        msg = _make_message()
+        msg.voice = MagicMock()
+        msg.voice.file_size = 100
+        msg.voice.get_file = AsyncMock()
+        msg.date = MagicMock()
+        msg.date.isoformat.return_value = "2026-08-19T20:00:00+00:00"
+        update = _make_update(msg)
+
+        hook = MagicMock(
+            return_value=[{"action": "skip", "reason": "not authorized"}]
+        )
+        with patch("hermes_cli.plugins.invoke_hook", hook):
+            await adapter._handle_media_message(update, MagicMock())
+
+        assert hook.call_args.kwargs["metadata"]["received_at"]
+        msg.voice.get_file.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pre_media_hook_invocation_failure_blocks_voice(self, adapter):
+        msg = _make_message()
+        msg.voice = MagicMock()
+        msg.voice.file_size = 100
+        msg.voice.get_file = AsyncMock()
+        update = _make_update(msg)
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=RuntimeError("plugin manager unavailable"),
+        ):
+            await adapter._handle_media_message(update, MagicMock())
+
+        msg.voice.get_file.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
 
 class TestVideoDownloadBlock:
     @pytest.mark.asyncio

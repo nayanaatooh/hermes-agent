@@ -8037,6 +8037,41 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
 
+    def _pre_media_download_blocked(self, update: Update, msg: Message) -> bool:
+        from hermes_cli.plugins import invoke_hook
+
+        reply = getattr(msg, "reply_to_message", None)
+        sender = getattr(msg, "from_user", None)
+        chat = getattr(msg, "chat", None)
+        received_at = getattr(msg, "date", None)
+        metadata = {
+            "update_id": getattr(update, "update_id", None),
+            "chat_id": getattr(chat, "id", None),
+            "thread_id": getattr(msg, "message_thread_id", None),
+            "message_id": getattr(msg, "message_id", None),
+            "reply_to_message_id": getattr(reply, "message_id", None) if reply else None,
+            "sender_user_id": getattr(sender, "id", None),
+            "media_kind": self._media_message_type(msg).value,
+            "received_at": received_at.isoformat() if received_at else None,
+        }
+        try:
+            results = invoke_hook(
+                "pre_gateway_media_download",
+                platform="telegram",
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("[Telegram] Pre-download media hook failed closed")
+            return True
+        for result in results:
+            if isinstance(result, dict) and result.get("action") == "skip":
+                logger.info(
+                    "[Telegram] Media consumed by pre-download hook: %s",
+                    result.get("reason", "no reason provided"),
+                )
+                return True
+        return False
+
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
@@ -8059,6 +8094,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(
                     _m, _event.message_type, update_id=update.update_id, event=_event
                 )
+            return
+        if self._pre_media_download_blocked(update, update.message):
             return
 
         msg = update.message

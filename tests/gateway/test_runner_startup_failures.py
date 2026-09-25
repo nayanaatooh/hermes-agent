@@ -511,6 +511,128 @@ async def test_runner_exits_with_ex_config_on_nonretryable_startup_error(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_runner_fails_before_adapter_connect_when_required_plugin_is_missing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")
+        },
+        sessions_dir=tmp_path / "sessions",
+        required_plugins=["pontomais-inbound"],
+    )
+    runner = GatewayRunner(config)
+
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_manager",
+        lambda: type("Manager", (), {"list_plugins": lambda self: []})(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_create_adapter",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("adapter creation must not run")
+        ),
+    )
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is True
+    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE
+    assert runner.adapters == {}
+    state = read_runtime_status()
+    assert state["gateway_state"] == "startup_failed"
+    assert state["exit_reason"] == "required plugin unavailable: pontomais-inbound"
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_when_required_plugin_did_not_register_required_hooks(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        sessions_dir=tmp_path / "sessions",
+        required_plugins=["pontomais-inbound"],
+        required_plugin_hooks={
+            "pontomais-inbound": [
+                "pre_gateway_dispatch",
+                "pre_gateway_media_download",
+            ]
+        },
+    )
+    runner = GatewayRunner(config)
+
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_manager",
+        lambda: type(
+            "Manager",
+            (),
+            {
+                "list_plugins": lambda self: [
+                    {
+                        "name": "pontomais-inbound",
+                        "key": "pontomais-inbound",
+                        "enabled": True,
+                        "error": None,
+                        "hook_names": ["pre_gateway_dispatch"],
+                    }
+                ]
+            },
+        )(),
+    )
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is True
+    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE
+    assert runner.exit_reason == (
+        "required plugin hooks unavailable: pontomais-inbound: "
+        "pre_gateway_media_download"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_direct_config_with_required_plugin_but_no_hooks(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(
+        GatewayConfig(
+            sessions_dir=tmp_path / "sessions",
+            required_plugins=["pontomais-inbound"],
+        )
+    )
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_manager",
+        lambda: type(
+            "Manager",
+            (),
+            {
+                "list_plugins": lambda self: [
+                    {
+                        "name": "pontomais-inbound",
+                        "key": "pontomais-inbound",
+                        "enabled": True,
+                        "error": None,
+                        "hook_names": [],
+                    }
+                ]
+            },
+        )(),
+    )
+
+    assert await runner.start() is True
+    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE
+    assert runner.exit_reason == "required plugin hooks not configured: pontomais-inbound"
+
+
+@pytest.mark.asyncio
 async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_path):
     """A clean exit carrying GATEWAY_FATAL_CONFIG_EXIT_CODE must surface as a
     process-level SystemExit(78) — NOT a truthy return — so main() exits 78

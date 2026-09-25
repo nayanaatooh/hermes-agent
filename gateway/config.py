@@ -660,6 +660,8 @@ class GatewayConfig:
     """
     # Platform configurations
     platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
+    required_plugins: List[str] = field(default_factory=list)
+    required_plugin_hooks: Dict[str, List[str]] = field(default_factory=dict)
     
     # Session reset policies by type
     default_reset_policy: SessionResetPolicy = field(default_factory=SessionResetPolicy)
@@ -805,6 +807,11 @@ class GatewayConfig:
             "platforms": {
                 p.value: c.to_dict() for p, c in self.platforms.items()
             },
+            "required_plugins": list(self.required_plugins),
+            "required_plugin_hooks": {
+                plugin: list(hooks)
+                for plugin, hooks in self.required_plugin_hooks.items()
+            },
             "default_reset_policy": self.default_reset_policy.to_dict(),
             "reset_by_type": {
                 k: v.to_dict() for k, v in self.reset_by_type.items()
@@ -919,8 +926,38 @@ class GatewayConfig:
         except (TypeError, ValueError):
             session_store_max_age_days = 90
 
+        required_plugins_raw = data.get("required_plugins", [])
+        if not isinstance(required_plugins_raw, list) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in required_plugins_raw
+        ):
+            raise ValueError("required_plugins_invalid")
+        required_plugins = [item.strip() for item in required_plugins_raw]
+
+        required_plugin_hooks_raw = data.get("required_plugin_hooks", {})
+        if not isinstance(required_plugin_hooks_raw, dict):
+            raise ValueError("required_plugin_hooks_invalid")
+        required_plugin_hooks: Dict[str, List[str]] = {}
+        for plugin, hooks in required_plugin_hooks_raw.items():
+            if (
+                not isinstance(plugin, str)
+                or not plugin.strip()
+                or not isinstance(hooks, list)
+                or not hooks
+                or any(not isinstance(hook, str) or not hook.strip() for hook in hooks)
+            ):
+                raise ValueError("required_plugin_hooks_invalid")
+            plugin_name = plugin.strip()
+            if plugin_name not in required_plugins:
+                raise ValueError("required_plugin_hooks_plugin_not_required")
+            required_plugin_hooks[plugin_name] = [hook.strip() for hook in hooks]
+        if set(required_plugin_hooks) != set(required_plugins):
+            raise ValueError("required_plugin_hooks_missing")
+
         return cls(
             platforms=platforms,
+            required_plugins=required_plugins,
+            required_plugin_hooks=required_plugin_hooks,
             default_reset_policy=default_policy,
             reset_by_type=reset_by_type,
             reset_by_platform=reset_by_platform,
@@ -1055,6 +1092,12 @@ def load_gateway_config() -> GatewayConfig:
 
             gateway_section = yaml_cfg.get("gateway")
             if isinstance(gateway_section, dict):
+                if "required_plugins" in gateway_section:
+                    gw_data["required_plugins"] = gateway_section["required_plugins"]
+                if "required_plugin_hooks" in gateway_section:
+                    gw_data["required_plugin_hooks"] = gateway_section[
+                        "required_plugin_hooks"
+                    ]
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]

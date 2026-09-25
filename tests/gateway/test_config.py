@@ -4,6 +4,8 @@ import logging
 import os
 from unittest.mock import patch
 
+import pytest
+
 from agent.secret_scope import reset_secret_scope, set_secret_scope
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from gateway.config import (
@@ -291,6 +293,60 @@ class TestStreamingConfig:
 
 
 class TestGatewayConfigRoundtrip:
+    def test_required_plugins_roundtrip(self):
+        config = GatewayConfig(
+            required_plugins=["pontomais-inbound"],
+            required_plugin_hooks={
+                "pontomais-inbound": [
+                    "pre_gateway_dispatch",
+                    "pre_gateway_media_download",
+                ]
+            },
+        )
+
+        restored = GatewayConfig.from_dict(config.to_dict())
+
+        assert restored.required_plugins == ["pontomais-inbound"]
+        assert restored.required_plugin_hooks == {
+            "pontomais-inbound": [
+                "pre_gateway_dispatch",
+                "pre_gateway_media_download",
+            ]
+        }
+
+    @pytest.mark.parametrize(
+        "raw_value",
+        ["pontomais-inbound", [""], [1], ["pontomais-inbound", None]],
+    )
+    def test_required_plugins_rejects_malformed_values(self, raw_value):
+        with pytest.raises(ValueError, match="required_plugins_invalid"):
+            GatewayConfig.from_dict({"required_plugins": raw_value})
+
+    @pytest.mark.parametrize(
+        "raw_value",
+        ["pre_gateway_dispatch", [], {"pontomais-inbound": []}, {"": ["hook"]}],
+    )
+    def test_required_plugin_hooks_rejects_malformed_values(self, raw_value):
+        with pytest.raises(ValueError, match="required_plugin_hooks_invalid"):
+            GatewayConfig.from_dict(
+                {
+                    "required_plugins": ["pontomais-inbound"],
+                    "required_plugin_hooks": raw_value,
+                }
+            )
+
+    def test_required_plugin_hooks_must_reference_required_plugin(self):
+        with pytest.raises(
+            ValueError, match="required_plugin_hooks_plugin_not_required"
+        ):
+            GatewayConfig.from_dict(
+                {"required_plugin_hooks": {"pontomais-inbound": ["hook"]}}
+            )
+
+    def test_each_required_plugin_must_declare_required_hooks(self):
+        with pytest.raises(ValueError, match="required_plugin_hooks_missing"):
+            GatewayConfig.from_dict({"required_plugins": ["pontomais-inbound"]})
+
     def test_full_roundtrip(self):
         config = GatewayConfig(
             platforms={

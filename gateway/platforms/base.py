@@ -1801,6 +1801,13 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Optional per-turn controls set by the pre_gateway_dispatch hook. Keep
+    # these at the end so positional construction through metadata/timestamp
+    # remains backward compatible.
+    delivery_mode: Optional[str] = None
+    persist_user_message: Optional[str] = None
+    gateway_dispatch_applied: bool = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -2104,6 +2111,19 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        existing_contract = (
+            existing.delivery_mode,
+            existing.persist_user_message,
+            existing.gateway_dispatch_applied,
+        )
+        incoming_contract = (
+            event.delivery_mode,
+            event.persist_user_message,
+            event.gateway_dispatch_applied,
+        )
+        if existing_contract != incoming_contract:
+            pending_messages[session_key] = event
+            return
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -2170,6 +2190,7 @@ _RETRYABLE_ERROR_PATTERNS = (
 # reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
 # ``None`` when the response was already delivered (e.g. via streaming).
 MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+PreGatewayDispatchHandler = Callable[[MessageEvent], Optional[MessageEvent]]
 
 
 def resolve_channel_prompt(
@@ -2349,6 +2370,7 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._pre_gateway_dispatch_handler: Optional[PreGatewayDispatchHandler] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -2796,6 +2818,13 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_pre_gateway_dispatch_handler(
+        self,
+        handler: Optional[PreGatewayDispatchHandler],
+    ) -> None:
+        """Install the synchronous gate that runs before any public activity."""
+        self._pre_gateway_dispatch_handler = handler
 
     def set_topic_recovery_fn(
         self,
@@ -4566,7 +4595,7 @@ class BasePlatformAdapter(ABC):
             # condition fix — issue #18912).  Previously the send happened
             # after cancel_session_processing, which could silently drop the
             # "/new" confirmation when an agent was actively running.
-            if _text:
+            if _text and event.delivery_mode != "suppress":
                 logger.info(
                     "[%s] Sending command '/%s' response (%d chars) to %s",
                     self.name,
@@ -4624,6 +4653,24 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        # Apply the generic inbound gate before session keying, busy routing,
+        # typing indicators, acknowledgments, or any other public activity.
+        # The runner marks the event so its defensive call is a no-op.
+        if not getattr(event, "internal", False):
+            pre_dispatch = getattr(self, "_pre_gateway_dispatch_handler", None)
+            if pre_dispatch is not None:
+                try:
+                    gated_event = pre_dispatch(event)
+                except Exception:
+                    logger.exception(
+                        "[%s] pre_gateway_dispatch handler failed; blocking inbound event",
+                        self.name,
+                    )
+                    return
+                if gated_event is None:
+                    return
+                event = gated_event
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -4680,7 +4727,7 @@ class BasePlatformAdapter(ABC):
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
-                    if _text:
+                    if _text and event.delivery_mode != "suppress":
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
@@ -4733,7 +4780,7 @@ class BasePlatformAdapter(ABC):
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
-                        if _text:
+                        if _text and event.delivery_mode != "suppress":
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
@@ -4830,6 +4877,7 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        delivery_suppressed = event.delivery_mode == "suppress"
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -4854,7 +4902,7 @@ class BasePlatformAdapter(ABC):
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
+        if getattr(self.config, "typing_indicator", True) and not delivery_suppressed:
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -4870,6 +4918,8 @@ class BasePlatformAdapter(ABC):
             )
 
         async def _stop_typing_task() -> None:
+            if typing_task is None:
+                return
             await self._stop_typing_refresh(
                 event.source.chat_id,
                 typing_task,
@@ -4881,6 +4931,18 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+
+            # Defense in depth for custom handlers that tighten the delivery
+            # contract while processing. Production runner events are gated
+            # before this task starts, so typing never begins for them.
+            delivery_suppressed = (
+                delivery_suppressed or event.delivery_mode == "suppress"
+            )
+
+            # The handler and agent still run in suppress mode, but this adapter
+            # must not expose their response, attachments, or fallback text.
+            if delivery_suppressed:
+                response = None
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -5235,6 +5297,8 @@ class BasePlatformAdapter(ABC):
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
+                if delivery_suppressed:
+                    return
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
@@ -5280,7 +5344,7 @@ class BasePlatformAdapter(ABC):
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
-            if callable(_post_cb):
+            if callable(_post_cb) and not delivery_suppressed:
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
@@ -5293,11 +5357,12 @@ class BasePlatformAdapter(ABC):
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.
-            await self._stop_typing_refresh(
-                event.source.chat_id,
-                None,
-                stop_attempts=1,
-            )
+            if not delivery_suppressed:
+                await self._stop_typing_refresh(
+                    event.source.chat_id,
+                    None,
+                    stop_attempts=1,
+                )
             # Final drain/release boundary: force-flush any timer that missed
             # the in-band drain before deciding whether the guard can clear.
             await self._flush_text_debounce_now(session_key)

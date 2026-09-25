@@ -400,6 +400,7 @@ class TestPluginDiscovery:
         }
         assert len(non_bundled) == 1
 
+
     def test_discover_skips_dir_without_manifest(self, tmp_path, monkeypatch):
         """Directories without plugin.yaml are silently skipped."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -658,6 +659,10 @@ class TestPluginHooks:
         )
         assert len(results) == 1
         assert results[0] == {"action": "skip", "reason": "test"}
+        state = next(
+            item for item in mgr.list_plugins() if item["name"] == "predispatch_plugin"
+        )
+        assert state["hook_names"] == ["pre_gateway_dispatch"]
 
     def test_register_and_invoke_hook(self, tmp_path, monkeypatch):
         """Registered hooks are called on invoke_hook()."""
@@ -708,6 +713,30 @@ class TestPluginHooks:
 
         # Should not raise despite 1/0
         mgr.invoke_hook("post_tool_call", tool_name="x", args={}, result="r", task_id="")
+
+    @pytest.mark.parametrize(
+        "hook_name",
+        ["pre_gateway_dispatch", "pre_gateway_media_download"],
+    )
+    def test_gateway_gate_hook_exception_returns_fail_closed_skip(
+        self, tmp_path, monkeypatch, hook_name
+    ):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "bad_media_hook",
+            register_body=(
+                f'ctx.register_hook("{hook_name}", lambda **kw: 1/0)'
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr.invoke_hook(
+            hook_name, platform="telegram", metadata={}
+        ) == [{"action": "skip", "reason": "hook_error"}]
 
     def test_hook_return_values_collected(self, tmp_path, monkeypatch):
         """invoke_hook() collects non-None return values from callbacks."""

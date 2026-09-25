@@ -171,6 +171,11 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Platform adapter gate fired before downloading or caching inbound media.
+    # Plugins may return {"action": "skip", "reason": "..."} to consume the
+    # message before bytes are fetched or an agent turn is created.
+    # Kwargs: platform: str, metadata: dict[str, object].
+    "pre_gateway_media_download",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -1924,6 +1929,11 @@ class PluginManager:
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
+                if hook_name in {
+                    "pre_gateway_dispatch",
+                    "pre_gateway_media_download",
+                }:
+                    results.append({"action": "skip", "reason": "hook_error"})
         return results
 
     def has_hook(self, hook_name: str) -> bool:
@@ -1992,6 +2002,7 @@ class PluginManager:
                     "enabled": loaded.enabled,
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
+                    "hook_names": sorted(loaded.hooks_registered),
                     "middleware": len(loaded.middleware_registered),
                     "commands": len(loaded.commands_registered),
                     "error": loaded.error,
